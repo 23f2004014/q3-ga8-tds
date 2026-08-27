@@ -1,4 +1,3 @@
-import hashlib
 import json
 import math
 import re
@@ -8,39 +7,31 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-
 app = FastAPI()
 
-# Persisted for the lifetime of the service.
-# The grader can replay the same request and observe the same mutation.
-ALIAS_VERSION = None
-REPLAYS = {}
+# Stateful champion alias.
+CHAMPION_ALIAS = None
+
+# Request fingerprint -> response.
+REPLAY_CACHE = {}
 
 SAFE_INT_MAX = (1 << 53) - 1
 
 TIMESTAMP_RE = re.compile(
-    r"^(?P<date>\d{4}-\d{2}-\d{2})T"
-    r"(?P<hour>\d{2}):"
-    r"(?P<minute>\d{2}):"
-    r"(?P<second>\d{2})"
-    r"(?:\.(?P<fraction>\d{1,3}))?"
-    r"(?P<tz>Z|[+-]\d{2}:\d{2})$"
+    r"^(\d{4}-\d{2}-\d{2})T"
+    r"(\d{2}):(\d{2}):(\d{2})"
+    r"(?:\.(\d{1,3}))?"
+    r"(Z|[+-]\d{2}:\d{2})$"
 )
 
-POSITIVE_CANONICAL_VERSION = re.compile(
-    r"^[1-9][0-9]*$"
-)
-
-HEX64 = re.compile(
-    r"^[0-9a-f]{64}$"
-)
+VERSION_RE = re.compile(r"^[1-9][0-9]*$")
 
 
 # ============================================================
-# Deterministic helpers
+# Helpers
 # ============================================================
 
-def compact_json(value: Any) -> str:
+def compact_json(value):
     return json.dumps(
         value,
         ensure_ascii=False,
@@ -48,19 +39,16 @@ def compact_json(value: Any) -> str:
     )
 
 
-def utf8(value: str) -> bytes:
+def utf8_key(value):
     return value.encode("utf-8")
 
 
 def sort_utf8(values):
-    return sorted(values, key=utf8)
+    return sorted(values, key=utf8_key)
 
 
 def sort_codes(values):
-    return sorted(
-        set(values),
-        key=utf8,
-    )
+    return sorted(set(values), key=utf8_key)
 
 
 def safe_integer(value):
@@ -71,7 +59,7 @@ def safe_integer(value):
     )
 
 
-def finite(value):
+def finite_number(value):
     return (
         isinstance(value, (int, float))
         and not isinstance(value, bool)
@@ -80,28 +68,29 @@ def finite(value):
 
 
 # ============================================================
-# Timestamp parsing
+# Timestamp
 # ============================================================
 
 def parse_timestamp(value):
     if not isinstance(value, str):
         return None
 
-    match = TIMESTAMP_RE.fullmatch(value)
+    m = TIMESTAMP_RE.fullmatch(value)
 
-    if not match:
+    if not m:
         return None
 
-    fraction = match.group("fraction") or ""
+    fraction = m.group(5) or ""
     fraction = fraction.ljust(3, "0")
 
-    tz_text = match.group("tz")
+    tz_text = m.group(6)
 
     try:
         if tz_text == "Z":
             tz = timezone.utc
         else:
             sign = 1 if tz_text[0] == "+" else -1
+
             hours = int(tz_text[1:3])
             minutes = int(tz_text[4:6])
 
@@ -121,17 +110,13 @@ def parse_timestamp(value):
                 )
             )
 
-        dt = datetime.strptime(
-            (
-                f"{match.group('date')}T"
-                f"{match.group('hour')}:"
-                f"{match.group('minute')}:"
-                f"{match.group('second')}"
-            ),
-            "%Y-%m-%dT%H:%M:%S",
-        )
-
-        dt = dt.replace(
+        dt = datetime(
+            year=int(m.group(1)[0:4]),
+            month=int(m.group(1)[5:7]),
+            day=int(m.group(1)[8:10]),
+            hour=int(m.group(2)),
+            minute=int(m.group(3)),
+            second=int(m.group(4)),
             microsecond=int(fraction) * 1000,
             tzinfo=tz,
         )
@@ -143,14 +128,14 @@ def parse_timestamp(value):
 
 
 # ============================================================
-# Version validation
+# Version
 # ============================================================
 
 def valid_version(value):
     if not isinstance(value, str):
         return False
 
-    if POSITIVE_CANONICAL_VERSION.fullmatch(value) is None:
+    if VERSION_RE.fullmatch(value) is None:
         return False
 
     try:
@@ -162,36 +147,14 @@ def valid_version(value):
 
 
 # ============================================================
-# Evaluation validation
+# Policy
 # ============================================================
 
-def validate_evaluation_shape(evaluation):
-    if not isinstance(evaluation, dict):
-        return False
-
-    required = {
-        "createdAt",
-        "artifactDigest",
-        "datasetDigest",
-        "schemaDigest",
-        "accuracy",
-        "latencyMs",
-        "sizeBytes",
-        "slices",
-    }
-
-    return set(evaluation.keys()) == required
-
-
-# ============================================================
-# Policy validation
-# ============================================================
-
-def validate_policy(policy):
+def valid_policy(policy):
     if not isinstance(policy, dict):
         return False
 
-    required = {
+    required = [
         "datasetDigest",
         "schemaDigest",
         "maxAgeSeconds",
@@ -200,9 +163,9 @@ def validate_policy(policy):
         "maxLatencyMs",
         "maxSizeBytes",
         "minImprovement",
-    }
+    ]
 
-    if set(policy.keys()) != required:
+    if any(key not in policy for key in required):
         return False
 
     if (
@@ -221,7 +184,7 @@ def validate_policy(policy):
         return False
 
     if (
-        not finite(policy["accuracyFloor"])
+        not finite_number(policy["accuracyFloor"])
         or not 0 <= float(policy["accuracyFloor"]) <= 1
     ):
         return False
@@ -235,13 +198,13 @@ def validate_policy(policy):
             return False
 
         if (
-            not finite(floor)
+            not finite_number(floor)
             or not 0 <= float(floor) <= 1
         ):
             return False
 
     if (
-        not finite(policy["maxLatencyMs"])
+        not finite_number(policy["maxLatencyMs"])
         or float(policy["maxLatencyMs"]) < 0
     ):
         return False
@@ -250,7 +213,7 @@ def validate_policy(policy):
         return False
 
     if (
-        not finite(policy["minImprovement"])
+        not finite_number(policy["minImprovement"])
         or not 0 <= float(policy["minImprovement"]) <= 1
     ):
         return False
@@ -259,24 +222,41 @@ def validate_policy(policy):
 
 
 # ============================================================
-# Evaluate one version
+# Version evaluation
 # ============================================================
 
-def evaluate_version(version_obj, as_of, policy):
+def check_version(version_obj, as_of, policy):
     codes = []
 
-    version = version_obj.get("version")
-
-    # Version itself must already be known valid here.
     evaluation = version_obj.get("evaluation")
 
     if evaluation is None:
-        codes.append("MISSING_EVALUATION")
-        return codes, None
+        return ["MISSING_EVALUATION"], None
 
-    if not validate_evaluation_shape(evaluation):
+    if not isinstance(evaluation, dict):
+        return ["MISSING_EVALUATION"], None
+
+    evaluation_required = [
+        "createdAt",
+        "artifactDigest",
+        "datasetDigest",
+        "schemaDigest",
+        "accuracy",
+        "latencyMs",
+        "sizeBytes",
+        "slices",
+    ]
+
+    if any(
+        key not in evaluation
+        for key in evaluation_required
+    ):
         codes.append("MISSING_EVALUATION")
-        return codes, None
+        return sort_codes(codes), evaluation
+
+    # --------------------------------------------------------
+    # Timestamp
+    # --------------------------------------------------------
 
     created_at = parse_timestamp(
         evaluation["createdAt"]
@@ -284,13 +264,13 @@ def evaluate_version(version_obj, as_of, policy):
 
     if created_at is None:
         codes.append("INVALID_TIMESTAMP")
+
     else:
 
         if created_at > as_of:
             codes.append("FUTURE_EVALUATION")
 
         else:
-
             age = (
                 as_of - created_at
             ).total_seconds()
@@ -301,7 +281,7 @@ def evaluate_version(version_obj, as_of, policy):
                 )
 
     # --------------------------------------------------------
-    # Numeric metrics
+    # Numeric evidence
     # --------------------------------------------------------
 
     accuracy = evaluation["accuracy"]
@@ -309,9 +289,9 @@ def evaluate_version(version_obj, as_of, policy):
     size = evaluation["sizeBytes"]
 
     if (
-        not finite(accuracy)
-        or not finite(latency)
-        or not finite(size)
+        not finite_number(accuracy)
+        or not finite_number(latency)
+        or not safe_integer(size)
     ):
         codes.append("NON_FINITE")
 
@@ -323,33 +303,26 @@ def evaluate_version(version_obj, as_of, policy):
         if float(latency) < 0:
             codes.append("METRIC_RANGE")
 
-        if (
-            not safe_integer(size)
-        ):
-            codes.append("METRIC_RANGE")
-
     # --------------------------------------------------------
-    # Artifact binding
+    # Artifact lineage
     # --------------------------------------------------------
-
-    registered_artifact = version_obj.get(
-        "artifactDigest"
-    )
-
-    evaluation_artifact = evaluation[
-        "artifactDigest"
-    ]
 
     if (
-        not isinstance(registered_artifact, str)
-        or not isinstance(evaluation_artifact, str)
-        or registered_artifact
-        != evaluation_artifact
+        not isinstance(
+            version_obj.get("artifactDigest"),
+            str,
+        )
+        or not isinstance(
+            evaluation["artifactDigest"],
+            str,
+        )
+        or version_obj["artifactDigest"]
+        != evaluation["artifactDigest"]
     ):
         codes.append("ARTIFACT_MISMATCH")
 
     # --------------------------------------------------------
-    # Dataset binding
+    # Dataset lineage
     # --------------------------------------------------------
 
     if (
@@ -359,7 +332,7 @@ def evaluate_version(version_obj, as_of, policy):
         codes.append("DATASET_MISMATCH")
 
     # --------------------------------------------------------
-    # Schema binding
+    # Schema lineage
     # --------------------------------------------------------
 
     if (
@@ -373,7 +346,7 @@ def evaluate_version(version_obj, as_of, policy):
     # --------------------------------------------------------
 
     if (
-        finite(accuracy)
+        finite_number(accuracy)
         and 0 <= float(accuracy) <= 1
         and float(accuracy)
         < float(policy["accuracyFloor"])
@@ -381,7 +354,7 @@ def evaluate_version(version_obj, as_of, policy):
         codes.append("ACCURACY_FLOOR")
 
     if (
-        finite(latency)
+        finite_number(latency)
         and float(latency) >= 0
         and float(latency)
         > float(policy["maxLatencyMs"])
@@ -395,18 +368,18 @@ def evaluate_version(version_obj, as_of, policy):
         codes.append("SIZE_LIMIT")
 
     # --------------------------------------------------------
-    # Slice gates
+    # Required slices
     # --------------------------------------------------------
 
     slices = evaluation["slices"]
 
     if not isinstance(slices, dict):
-        # Treat malformed slice container as missing
-        # every required slice.
+
         for name in policy["requiredSlices"]:
             codes.append(
                 f"MISSING_SLICE:{name}"
             )
+
     else:
 
         for name, floor in policy[
@@ -421,10 +394,13 @@ def evaluate_version(version_obj, as_of, policy):
 
             value = slices[name]
 
-            if (
-                not finite(value)
-                or not 0 <= float(value) <= 1
-            ):
+            if not finite_number(value):
+                codes.append(
+                    f"SLICE_RANGE:{name}"
+                )
+                continue
+
+            if not 0 <= float(value) <= 1:
                 codes.append(
                     f"SLICE_RANGE:{name}"
                 )
@@ -439,83 +415,72 @@ def evaluate_version(version_obj, as_of, policy):
 
 
 # ============================================================
-# Main promotion logic
+# Promotion
 # ============================================================
 
-def process_promote(payload):
-    global ALIAS_VERSION
+def build_promotion(payload):
+    global CHAMPION_ALIAS
 
     # --------------------------------------------------------
-    # Top-level validation
+    # Required request fields
     # --------------------------------------------------------
 
-    required = {
+    required = [
         "asOf",
         "championVersion",
         "policy",
         "versions",
-    }
+    ]
 
-    if set(payload.keys()) != required:
-        return None, 400
+    if any(key not in payload for key in required):
+        return None
 
     if not isinstance(
         payload["championVersion"],
         str,
     ):
-        return None, 400
+        return None
 
     if not isinstance(
         payload["versions"],
         list,
     ):
-        return None, 400
+        return None
 
     as_of = parse_timestamp(
         payload["asOf"]
     )
 
-    # A malformed asOf is an invalid policy/request
-    # rather than a valid evidence timestamp.
     if as_of is None:
-        return None, 400
-
-    if not validate_policy(
-        payload["policy"]
-    ):
-        return None, 400
+        return None
 
     policy = payload["policy"]
 
-    champion_version = payload[
+    if not valid_policy(policy):
+        return None
+
+    champion = payload[
         "championVersion"
     ]
 
-    # --------------------------------------------------------
-    # Every occurrence gets validated BEFORE lookup maps.
-    # --------------------------------------------------------
-
     failed_gates = {}
+    eligible = []
+    evidence = {}
 
-    valid_occurrences = []
+    seen = set()
 
-    seen_versions = set()
+    # --------------------------------------------------------
+    # Validate every occurrence before lookup maps.
+    # --------------------------------------------------------
 
-    for version_obj in payload["versions"]:
+    for item in payload["versions"]:
 
-        if not isinstance(version_obj, dict):
-            # No usable version ID exists.
-            # The contract's failedGates is version keyed,
-            # so malformed anonymous entries only contribute
-            # to INVALID_VERSION under a null-like key.
+        if not isinstance(item, dict):
             continue
 
-        version = version_obj.get(
-            "version"
-        )
+        version = item.get("version")
 
         if not valid_version(version):
-
             if isinstance(version, str):
                 failed_gates.setdefault(
                     version,
@@ -523,11 +488,9 @@ def process_promote(payload):
                 ).append(
                     "INVALID_VERSION"
                 )
-
             continue
 
-        # Duplicate/noncanonical checks happen before maps.
-        if version in seen_versions:
+        if version in seen:
 
             failed_gates.setdefault(
                 version,
@@ -538,98 +501,66 @@ def process_promote(payload):
 
             continue
 
-        seen_versions.add(version)
+        seen.add(version)
 
-        valid_occurrences.append(
-            version_obj
-        )
-
-    # --------------------------------------------------------
-    # Evaluate all valid unique versions.
-    # --------------------------------------------------------
-
-    eligible = []
-    evidence_map = {}
-
-    for version_obj in valid_occurrences:
-
-        version = version_obj["version"]
-
-        codes, evaluation = evaluate_version(
-            version_obj,
+        codes, ev = check_version(
+            item,
             as_of,
             policy,
         )
 
         if codes:
             failed_gates[version] = (
-                list(
-                    failed_gates.get(
-                        version,
-                        []
-                    )
+                failed_gates.get(
+                    version,
+                    []
                 )
                 + codes
             )
-
         else:
             eligible.append(version)
-            evidence_map[version] = evaluation
+            evidence[version] = ev
 
     # --------------------------------------------------------
-    # Canonicalize failed gates.
+    # Deduplicate / sort codes.
     # --------------------------------------------------------
 
-    for version in list(failed_gates.keys()):
+    for version in failed_gates:
         failed_gates[version] = sort_codes(
             failed_gates[version]
         )
 
+    eligible = sort_utf8(eligible)
+
     # --------------------------------------------------------
-    # Champion evidence must be valid.
+    # Champion must be valid and eligible.
     # --------------------------------------------------------
 
     champion_valid = (
-        valid_version(champion_version)
-        and champion_version in eligible
+        valid_version(champion)
+        and champion in seen
+        and champion in eligible
     )
-
-    # Champion must be listed.
-    if (
-        valid_version(champion_version)
-        and champion_version
-        not in seen_versions
-    ):
-        champion_valid = False
 
     if not champion_valid:
 
-        response = {
+        return {
             "action": "block",
-            "championVersion": champion_version,
+            "championVersion": champion,
             "selectedVersion": None,
-            "eligibleVersions": sort_utf8(
-                eligible
-            ),
+            "eligibleVersions": eligible,
             "failedGates": failed_gates,
             "aliasMutation": None,
             "evidence": None,
         }
 
-        return response, 200
-
     # --------------------------------------------------------
-    # Rank eligible versions:
-    #
-    # accuracy DESC
-    # latency ASC
-    # size ASC
-    # numeric version ASC
+    # Rank eligible versions.
     # --------------------------------------------------------
 
-    def rank_key(version):
+    def ranking(version):
 
-        ev = evidence_map[version]
+        ev = evidence[version]
 
         return (
             -float(ev["accuracy"]),
@@ -640,89 +571,66 @@ def process_promote(payload):
 
     ranked = sorted(
         eligible,
-        key=rank_key,
+        key=ranking,
     )
 
-    selected_version = ranked[0]
+    challenger = ranked[0]
 
-    champion_eval = evidence_map[
-        champion_version
-    ]
+    # Champion remains winner.
+    if challenger == champion:
 
-    selected_eval = evidence_map[
-        selected_version
-    ]
-
-    # --------------------------------------------------------
-    # Champion wins -> retain.
-    # --------------------------------------------------------
-
-    if selected_version == champion_version:
-
-        response = {
+        return {
             "action": "retain",
-            "championVersion": champion_version,
-            "selectedVersion": champion_version,
-            "eligibleVersions": sort_utf8(
-                eligible
-            ),
+            "championVersion": champion,
+            "selectedVersion": champion,
+            "eligibleVersions": eligible,
             "failedGates": failed_gates,
             "aliasMutation": None,
-            "evidence": champion_eval,
+            "evidence": evidence[champion],
         }
 
-        return response, 200
-
     # --------------------------------------------------------
-    # Challenger improvement.
+    # Improvement gate.
     # --------------------------------------------------------
 
     improvement = round(
-        float(selected_eval["accuracy"])
-        - float(champion_eval["accuracy"]),
+        float(evidence[challenger]["accuracy"])
+        - float(evidence[champion]["accuracy"]),
         12,
     )
 
-    if improvement >= float(
+    if improvement < float(
         policy["minImprovement"]
     ):
 
-        ALIAS_VERSION = selected_version
-
-        response = {
-            "action": "promote",
-            "championVersion": champion_version,
-            "selectedVersion": selected_version,
-            "eligibleVersions": sort_utf8(
-                eligible
-            ),
+        return {
+            "action": "retain",
+            "championVersion": champion,
+            "selectedVersion": champion,
+            "eligibleVersions": eligible,
             "failedGates": failed_gates,
-            "aliasMutation": {
-                "alias": "champion",
-                "version": selected_version,
-            },
-            "evidence": selected_eval,
+            "aliasMutation": None,
+            "evidence": evidence[champion],
         }
 
-        return response, 200
-
     # --------------------------------------------------------
-    # Challenger is eligible but doesn't improve enough.
+    # Promote.
     # --------------------------------------------------------
 
-    response = {
-        "action": "retain",
-        "championVersion": champion_version,
-        "selectedVersion": champion_version,
-        "eligibleVersions": sort_utf8(
-            eligible
-        ),
+    CHAMPION_ALIAS = challenger
+
+    return {
+        "action": "promote",
+        "championVersion": champion,
+        "selectedVersion": challenger,
+        "eligibleVersions": eligible,
         "failedGates": failed_gates,
-        "aliasMutation": None,
-        "evidence": champion_eval,
+        "aliasMutation": {
+            "alias": "champion",
+            "version": challenger,
+        },
+        "evidence": evidence[challenger],
     }
-
-    return response, 200
 
 
 # ============================================================
@@ -746,32 +654,25 @@ async def promote(request: Request):
             status_code=400,
         )
 
-    # Required top-level checks that explicitly require
-    # HTTP 400 with the exact body.
-    if "championVersion" not in payload:
-        return JSONResponse(
-            {"error": "INVALID_INPUT"},
-            status_code=400,
+    # These cases are explicitly specified as HTTP 400.
+    if (
+        "championVersion" not in payload
+        or not isinstance(
+            payload["championVersion"],
+            str,
         )
-
-    if not isinstance(
-        payload["championVersion"],
-        str,
     ):
         return JSONResponse(
             {"error": "INVALID_INPUT"},
             status_code=400,
         )
 
-    if "versions" not in payload:
-        return JSONResponse(
-            {"error": "INVALID_INPUT"},
-            status_code=400,
+    if (
+        "versions" not in payload
+        or not isinstance(
+            payload["versions"],
+            list,
         )
-
-    if not isinstance(
-        payload["versions"],
-        list,
     ):
         return JSONResponse(
             {"error": "INVALID_INPUT"},
@@ -779,34 +680,27 @@ async def promote(request: Request):
         )
 
     # --------------------------------------------------------
-    # Deterministic replay.
+    # Replay identity.
     # --------------------------------------------------------
 
-    fingerprint = hashlib.sha256(
-        compact_json(payload).encode("utf-8")
-    ).hexdigest()
+    request_key = compact_json(payload)
 
-    if fingerprint in REPLAYS:
+    if request_key in REPLAY_CACHE:
         return JSONResponse(
-            REPLAYS[fingerprint]
+            REPLAY_CACHE[request_key]
         )
 
-    response, status = process_promote(
-        payload
-    )
+    result = build_promotion(payload)
 
-    if response is None:
+    if result is None:
         return JSONResponse(
             {"error": "INVALID_INPUT"},
-            status_code=status,
+            status_code=400,
         )
 
-    REPLAYS[fingerprint] = response
+    REPLAY_CACHE[request_key] = result
 
-    return JSONResponse(
-        response,
-        status_code=status,
-    )
+    return JSONResponse(result)
 
 
 @app.get("/")
